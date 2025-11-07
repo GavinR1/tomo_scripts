@@ -7,7 +7,7 @@ Each input file is assumed to contain:
 The filename (without ".coords") is used as rlnTomoName.
 
 Usage:
-  python slabpick_prep.py -i ./coords -o all_picks.star
+  python coords2star.py -i ./coords -o all_picks.star
 """
 
 import argparse
