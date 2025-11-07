@@ -1,0 +1,337 @@
+
+#!/usr/bin/env python3
+"""filter_mdoc_from_aln.py
+
+Read an alignment (.aln) file and an mdoc file. The script parses the TILT
+column from the aln file's first data table and filters the mdoc blocks to 
+keep only those whose TiltAngle values match a tilt angle from the aln table
+(within a tolerance of 0.25 degrees).
+
+Usage:
+	python filter_mdoc_from_aln.py --aln path/to/file.aln --mdoc path/to/file.mdoc
+
+The script will save a timestamped backup of the original mdoc before
+overwriting it. Use --dry-run to see what would be removed without writing.
+
+The script requires the aln file to have a header line containing a 'TILT'
+column (case-insensitive). It will error if this header is missing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Tuple, Set
+
+
+
+def _parse_aln_table_rows(path: Path) -> Tuple[List[str] | None, List[List[str]]]:
+	"""Return (header_tokens or None, rows) for the first numeric table in aln.
+
+	This parses the first table in an AreTomo .aln file, looking for a header
+	line followed by rows of numeric data. The header line is expected to name
+	the columns including a 'TILT' column. Each data row should start with an
+	integer (typically an image index) followed by float values.
+
+	Returns:
+		- header_tokens: List[str] | None - The space-split tokens from header line
+		- rows: List[List[str]] - List of space-split tokens from each data row
+	"""
+	with path.open('r', encoding='utf-8', errors='surrogateescape') as fh:
+		lines = fh.readlines()
+
+	# find table start index
+	table_start = None
+	for idx, raw in enumerate(lines):
+		line = raw.strip()
+		if not line or line.startswith('#'):
+			continue
+		first_tok = line.split()[0]
+		try:
+			int(first_tok)
+		except Exception:
+			continue
+		table_start = idx
+		break
+
+	if table_start is None:
+		raise ValueError(f"No numeric table found in aln file: {path}")
+
+	header_tokens = None
+	if table_start > 0:
+		prev_raw = lines[table_start - 1].rstrip('\n')
+		prev = prev_raw.strip()
+		if not prev:
+			header_tokens = None
+		else:
+			if prev.lstrip().startswith('#'):
+				prev = re.sub(r"^\s*#\s?", "", prev)
+			if prev:
+				header_tokens = re.split(r"\s+", prev)
+
+	# collect rows starting at table_start until a non-numeric-first-token line
+	rows: List[List[str]] = []
+	for raw in lines[table_start:]:
+		line = raw.strip()
+		if not line or line.startswith('#'):
+			break
+		first_tok = line.split()[0]
+		try:
+			int(first_tok)
+		except Exception:
+			break
+		rows.append(re.split(r"\s+", line))
+
+	return header_tokens, rows
+
+
+def _extract_tilt_angles_from_aln(path: Path) -> List[float]:
+	"""Extract a list of tilt angles (floats) from the first aln table.
+
+	Parses the aln table to find the 'TILT' column (case-insensitive) from 
+	the header line and extracts all tilt angle values from that column. The
+	angles are returned in the same order they appear in the file.
+
+	Args:
+		path: Path to an AreTomo .aln file
+
+	Returns:
+		List of tilt angles as floats
+
+	Raises:
+		ValueError: If no header is found, no TILT column exists in header,
+			or no tilt values could be parsed from the table.
+	"""
+	header, rows = _parse_aln_table_rows(path)
+	if not rows:
+		raise ValueError(f"No rows found in aln table: {path}")
+
+	if not header:
+		raise ValueError("ALN table is missing a header line; expected column names including 'TILT'")
+
+	# find the TILT column in the header
+	tilt_col = None
+	for i, tok in enumerate(header):
+		norm = re.sub(r"[^A-Za-z0-9]", "", tok).lower()
+		if norm == 'tilt':
+			tilt_col = i
+			break
+
+	if tilt_col is None:
+		raise ValueError("Could not find a 'TILT' column in the aln table header")
+
+	tilts: List[float] = []
+	for r in rows:
+		if len(r) <= tilt_col:
+			continue
+		tok = r[tilt_col]
+		try:
+			v = float(tok)
+		except Exception:
+			continue
+		tilts.append(v)
+
+	if not tilts:
+		raise ValueError("No tilt-angle values could be parsed from aln table")
+
+	return tilts
+
+
+def parse_mdoc_blocks(path: Path) -> Tuple[str, List[Tuple[int, List[str]]]]:
+	"""Parse an mdoc into header and a list of (zvalue, block_lines).
+
+	Each block starts with a line matching: [ZValue = <number>] and may contain
+	metadata including a TiltAngle value.
+
+	Returns:
+		- header: str - All content before the first ZValue block
+		- blocks: List[Tuple[int, List[str]]] - List of (zvalue, block_lines)
+	"""
+	z_re = re.compile(r"^\[ZValue\s*=\s*(\d+)\]", re.IGNORECASE)
+	with path.open('r', encoding='utf-8', errors='surrogateescape') as fh:
+		lines = fh.readlines()
+
+	header_lines: List[str] = []
+	blocks: List[Tuple[int, List[str]]] = []
+
+	current_block: List[str] = []
+	current_z: int | None = None
+	in_block = False
+
+	for line in lines:
+		m = z_re.match(line.strip())
+		if m:
+			# start a new block
+			if in_block and current_z is not None:
+				blocks.append((current_z, current_block))
+			current_block = [line.rstrip('\n')]
+			current_z = int(m.group(1))
+			in_block = True
+		else:
+			if in_block:
+				current_block.append(line.rstrip('\n'))
+			else:
+				header_lines.append(line.rstrip('\n'))
+
+	if in_block and current_z is not None:
+		blocks.append((current_z, current_block))
+
+	header = '\n'.join(header_lines).rstrip('\n') + ('\n' if header_lines else '')
+	# each block is a list of lines without trailing newlines
+	return header, blocks
+
+
+def write_mdoc(path: Path, header: str, blocks: List[Tuple[int, List[str]]]) -> None:
+	"""Write an mdoc file from a header and list of blocks.
+
+	Args:
+		path: Output path for the mdoc file
+		header: Content to write before any blocks
+		blocks: List of (zvalue, block_lines) tuples to write in order
+	"""
+	with path.open('w', encoding='utf-8', newline='\n') as fh:
+		if header:
+			fh.write(header)
+		for z, lines in blocks:
+			for ln in lines:
+				fh.write(ln + '\n')
+			fh.write('\n')
+
+
+def filter_mdoc_by_aln(aln_path: Path, mdoc_path: Path, dry_run: bool = False) -> Dict[str, object]:
+	"""Filter mdoc blocks by matching their TiltAngle values to aln tilts.
+
+	This reads tilt angles from the aln file's TILT column and keeps only
+	mdoc blocks whose TiltAngle values match an aln tilt within tolerance
+	(±0.25 degrees). A backup of the original mdoc is saved before modifying.
+
+	Args:
+		aln_path: Path to input .aln file
+		mdoc_path: Path to input/output .mdoc file
+		dry_run: If True, only report what would be done without modifying
+
+	Returns:
+		Dict with diagnostic information including:
+		- total_blocks: Number of blocks in original mdoc
+		- kept: Number of blocks kept after filtering
+		- removed: Number of blocks removed
+		- aln_tilts: List of tilt angles from aln file
+		- matched_aln_indices: Indices of aln tilts that matched mdoc blocks
+		- removed_zvalues: ZValues of removed mdoc blocks
+		- unmatched_aln_tilts: Aln tilts with no matching mdoc block
+		- backup: Path to backup file (only if not dry_run)
+	"""
+	# read tilt angles from the aln table (TILT column)
+	aln_tilts = _extract_tilt_angles_from_aln(aln_path)
+
+	# parse the mdoc into blocks
+	header, blocks = parse_mdoc_blocks(mdoc_path)
+
+	# helper to parse TiltAngle from a block's lines
+	_tilt_re = re.compile(r"^\s*TiltAngle\s*=\s*([+-]?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?)", re.IGNORECASE)
+
+	def _parse_tilt_from_block(block_lines: List[str]) -> float | None:
+		for ln in block_lines:
+			m = _tilt_re.match(ln)
+			if m:
+				try:
+					return float(m.group(1))
+				except Exception:
+					return None
+		return None
+
+	# choose a tolerance for float matching (degrees)
+	tol = 0.25
+
+	kept: List[Tuple[int, List[str]]] = []
+	removed: List[Tuple[int, List[str]]] = []
+
+	# track which aln tilts were matched
+	matched_aln_indices: Set[int] = set()
+
+	for z, blk in blocks:
+		bt = _parse_tilt_from_block(blk)
+		if bt is None:
+			# no tilt in block -> remove
+			removed.append((z, blk))
+			continue
+		# find any aln tilt within tolerance
+		matched = False
+		for ai, at in enumerate(aln_tilts):
+			if abs(at - bt) <= tol:
+				matched = True
+				matched_aln_indices.add(ai)
+				break
+		if matched:
+			kept.append((z, blk))
+		else:
+			removed.append((z, blk))
+
+	result: Dict[str, object] = {
+		'total_blocks': len(blocks),
+		'kept': len(kept),
+		'removed': len(removed),
+	}
+
+	# diagnostics: report aln tilts and which were matched/left out
+	result['aln_tilts'] = aln_tilts
+	result['matched_aln_indices'] = sorted(list(matched_aln_indices))
+	# list removed zvalues
+	result['removed_zvalues'] = [z for z, _ in removed]
+	# list of aln tilts that had no corresponding mdoc block
+	result['unmatched_aln_tilts'] = [t for i, t in enumerate(aln_tilts) if i not in matched_aln_indices]
+
+	if dry_run:
+		return result
+
+	# backup original: prefer filename_original.mdoc; if that exists, add timestamp
+	backup_path = mdoc_path.with_name(mdoc_path.stem + '_original' + mdoc_path.suffix)
+	if backup_path.exists():
+		stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+		backup_path = mdoc_path.with_name(mdoc_path.stem + f'_original_{stamp}' + mdoc_path.suffix)
+	shutil.copy2(mdoc_path, backup_path)
+
+	write_mdoc(mdoc_path, header, kept)
+	result['backup'] = str(backup_path)
+	return result
+
+
+def main(argv: List[str] | None = None) -> int:
+	parser = argparse.ArgumentParser(description='Filter mdoc entries using aln file table')
+	parser.add_argument('--aln', '-a', required=True, help='path to aln file')
+	parser.add_argument('--mdoc', '-m', required=True, help='path to mdoc file to filter')
+	parser.add_argument('--dry-run', action='store_true', help='do not modify files, only report')
+	args = parser.parse_args(argv)
+
+	aln_path = Path(args.aln)
+	mdoc_path = Path(args.mdoc)
+
+	if not aln_path.exists():
+		print(f'ERROR: aln file not found: {aln_path}', file=sys.stderr)
+		return 2
+	if not mdoc_path.exists():
+		print(f'ERROR: mdoc file not found: {mdoc_path}', file=sys.stderr)
+		return 2
+
+	try:
+		res = filter_mdoc_by_aln(aln_path, mdoc_path, dry_run=args.dry_run)
+	except Exception as e:
+		print(f'ERROR: {e}', file=sys.stderr)
+		return 3
+
+	print('mdoc filter summary:')
+	print(f"  total blocks: {res['total_blocks']}")
+	print(f"  kept:         {res['kept']}")
+	print(f"  removed:      {res['removed']}")
+	if not args.dry_run:
+		print(f"  backup saved to: {res.get('backup')}")
+
+	return 0
+
+
+if __name__ == '__main__':
+	raise SystemExit(main())
