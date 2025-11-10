@@ -75,7 +75,7 @@ def main():
 
     rows = parse_aln(args.in_aln)
     if not rows:
-        raise SystemExit("❌ No global alignment rows found in input .aln file.")
+        raise SystemExit("No global alignment rows found in input .aln file.")
 
     with open(args.out_xf, "w") as f:
         for _, rot, gmag, tx, ty in rows:
