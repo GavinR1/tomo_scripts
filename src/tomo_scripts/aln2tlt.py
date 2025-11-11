@@ -8,7 +8,7 @@ existing IMOD .tlt examples.
 Example:
         python aln2tlt.py --in_aln Position_001_EVN_ali.aln --out_tlt Position_001_EVN.tlt
             or
-        for f in *.aln; do python aln2tlt.py --in_aln "$f" --out_xf "$(basename "$f" | sed -E 's/^.*(24mar.*)\.aln$/\1.tlt/')"; done
+        for f in *.aln; do python aln2tlt.py --in_aln "$f" --out_tlt "$(basename "$f" | sed -E 's/^.*(24mar.*)\.aln$/\1.tlt/')"; done
 """
 
 import argparse
