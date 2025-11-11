@@ -1,103 +1,87 @@
-"""
-Convert AreTomo .aln (global alignment section) to IMOD-style .tlt transform file
-(a11 a12 a21 a22 dx dy per section).
+"""Extract the TILT column from an AreTomo .aln file and write an IMOD .tlt file.
+
+This script reads the first (global) alignment table in an AreTomo .aln file,
+extracts the 'TILT' column, and writes one tilt angle per line to the output
+.tlt file, formatted with two decimal places and a field width that matches
+existing IMOD .tlt examples.
 
 Example:
-    python aln2tlt.py --in_aln Position_001_EVN_ali.aln --out_tlt Position_001_EVN.tlt
-    or
-    for f in *.aln; do python aln2tlt.py --in_aln "$f" --out_xf "$(basename "$f" | sed -E 's/^.*(24mar.*)\.aln$/\1.tlt/')"; done
-
-Batch:
-    for f in *.aln; do \
-      python aln2tlt.py --in_aln "$f" \
-        --out_tlt "$(basename "$f" .aln).tlt"; \
-    done
-
-Notes:
-- The 2×2 block is built from ROT (degrees): [[cos, sin], [-sin, cos]].
-- dx,dy are computed as -(R * [TX, TY]).
-- If GMAG (AreTomo magnification) and/or a binning --scale are present, they
-  multiply only the 2×2 block (a11..a22), not the translations.
+        python aln2tlt.py --in_aln Position_001_EVN_ali.aln --out_tlt Position_001_EVN.tlt
+            or
+        for f in *.aln; do python aln2tlt.py --in_aln "$f" --out_xf "$(basename "$f" | sed -E 's/^.*(24mar.*)\.aln$/\1.tlt/')"; done
 """
 
 import argparse
-import math
 import re
 from pathlib import Path
-from typing import Optional
 
 
-def parse_aln(aln_path: Path):
-    """Parse AreTomo .aln file and extract rows from the global alignment table."""
+def parse_aln_tilts(aln_path: Path):
+    """Parse AreTomo .aln file and extract the TILT column from the first numeric table.
+
+    This is a simple and robust approach: find the first contiguous block of
+    non-comment lines where the first token is an integer (the global table),
+    then take the last token of each row as the tilt angle.
+    """
     rows = []
-    in_global = False
-    with open(aln_path, "r") as f:
-        for line in f:
-            if re.match(r"^\s*#\s*SEC", line):
-                in_global = True
-                continue
-            if in_global:
-                if not line.strip() or line.lstrip().startswith("#"):
+    table_started = False
+    with open(aln_path, "r") as fh:
+        for raw in fh:
+            line = raw.strip()
+            # skip empty/comment lines before the table
+            if not line or line.startswith('#'):
+                if table_started:
                     break
-                parts = line.split()
-                if len(parts) < 5:
-                    continue
-                sec = int(parts[0])
-                rot = float(parts[1])
-                gmag = float(parts[2])
-                tx = float(parts[3])
-                ty = float(parts[4])
-                rows.append((sec, rot, gmag, tx, ty))
-    rows.sort(key=lambda r: r[0])
-    return rows
+                continue
+            first_tok = line.split()[0]
+            try:
+                int(first_tok)
+            except Exception:
+                # not a data row
+                if table_started:
+                    break
+                continue
+            table_started = True
+            rows.append(line.split())
+
+    if not rows:
+        raise ValueError(f"No numeric table found in aln file: {aln_path}")
+
+    tilts = []
+    for parts in rows:
+        # assume tilt is the last column in the data rows
+        if not parts:
+            continue
+        tilt_tok = parts[-1]
+        try:
+            tilts.append(float(tilt_tok))
+        except Exception:
+            continue
+
+    if not tilts:
+        raise ValueError(f"No tilt angles parsed from aln file: {aln_path}")
+    return tilts
 
 
-def to_tlt_row(rot_deg: float, gmag: float, tx: float, ty: float, scale: Optional[float]):
-    """
-    Convert AreTomo ROT/GMAG/TX/TY to IMOD .tlt row (a11 a12 a21 a22 dx dy).
-
-    Matrix = s * [[cos, sin], [-sin, cos]], where s = gmag * scale (if provided).
-    Translations are -(R * [tx, ty]) (not multiplied by s).
-    """
-    s = gmag * (scale if scale is not None else 1.0)
-    th = math.radians(rot_deg)
-    c, si = math.cos(th), math.sin(th)
-
-    a11 = s * c
-    a12 = s * si
-    a21 = -s * si
-    a22 = s * c
-
-    dx = -(c * tx + si * ty)
-    dy = -(-si * tx + c * ty)
-    return a11, a12, a21, a22, dx, dy
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert AreTomo .aln (global table) to IMOD-style .tlt (a11 a12 a21 a22 dx dy)."
+        description="Extract the TILT column from an AreTomo .aln and write an IMOD .tlt file."
     )
     parser.add_argument("--in_aln", type=Path, required=True, help="Input AreTomo .aln file")
     parser.add_argument("--out_tlt", type=Path, required=True, help="Output IMOD .tlt file")
-    parser.add_argument(
-        "--scale",
-        type=float,
-        default=None,
-        help="Optional extra multiplicative scale (e.g., binning) applied to the 2×2 matrix only.",
-    )
 
     args = parser.parse_args()
 
-    rows = parse_aln(args.in_aln)
-    if not rows:
-        raise SystemExit("No global alignment rows found in input .aln file.")
+    tilts = parse_aln_tilts(args.in_aln)
 
+    # write one tilt angle per line
     with open(args.out_tlt, "w") as f:
-        for _, rot, gmag, tx, ty in rows:
-            a11, a12, a21, a22, dx, dy = to_tlt_row(rot, gmag, tx, ty, args.scale)
-            f.write(f"{a11:9.3f} {a12:9.3f} {a21:9.3f} {a22:9.3f} {dx:9.2f} {dy:9.2f}\n")
+        for t in tilts:
+            f.write(f"{t:7.2f}\n")
 
-    print(f"Wrote {len(rows)} transforms to {args.out_tlt}")
+    print(f"Wrote {len(tilts)} tilt angles to {args.out_tlt}")
 
 
 if __name__ == "__main__":
