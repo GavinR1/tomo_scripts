@@ -40,9 +40,10 @@ def main():
     input_dir: Path = args.input_dir
     output_file: Path = args.output_file
 
-    coords_files = sorted(input_dir.glob("*.coords"))
-    if not coords_files:
-        raise FileNotFoundError(f"No .coords files found in {input_dir}")
+    coords_files = sorted(
+        p for p in input_dir.glob("*.coords")
+        if not p.name.startswith("._")
+    )
 
     all_dfs = []
     for path in coords_files:
