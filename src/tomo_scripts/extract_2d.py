@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project particles into a CryoSPARC stack, loading one tomogram into RAM at a time."""
+"""Project particles into a stack."""
 
 from argparse import ArgumentParser, SUPPRESS
 from pathlib import Path
