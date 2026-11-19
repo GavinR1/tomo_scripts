@@ -8,6 +8,7 @@ import pandas as pd
 from pathlib import Path
 import mrcfile
 import starfile
+from tqdm import tqdm
 
 COORD_COLUMNS = ["rlnCoordinateX", "rlnCoordinateY", "rlnCoordinateZ"]
 TOMO_COLUMN = "rlnTomoName"
@@ -101,9 +102,11 @@ def run(args: argparse.Namespace) -> None:
     optics_by_apix = {}
     particle_rows = []
     skipped = 0
-    for name, rows in groups:
+    for number, (name, rows) in enumerate(groups, start=1):
         path, prefix = tomograms[name]
-        with mrcfile.mmap(path) as mrc:
+        label = f"{number}/{groups.ngroups} {name}"
+        tqdm.write(f"{label}: loading tomogram into RAM")
+        with mrcfile.open(path, mode="r") as mrc:
             if mrc.data.ndim != 3:
                 raise ValueError(f"{path} must contain a 3D tomogram")
             spacing = np.array([float(mrc.voxel_size[axis]) for axis in ("x", "y", "z")])
@@ -115,8 +118,9 @@ def run(args: argparse.Namespace) -> None:
             coords = rows[COORD_COLUMNS].to_numpy(dtype=float)
             if args.coords_scale is not None:
                 coords = coords * args.coords_scale / spacing
-            written = extract_and_write(coords, mrc.data, particle_dir, apix=tuple(spacing),
-                                        tomoname=prefix, box_size=args.boxsize)
+            with tqdm(coords, desc=f"{label}: extracting", unit="pick") as progress:
+                written = extract_and_write(progress, mrc.data, particle_dir, apix=tuple(spacing),
+                                            tomoname=prefix, box_size=args.boxsize)
         skipped += len(rows) - len(written)
         if written:
             group = optics_by_apix.setdefault(apix, len(optics_by_apix) + 1)
