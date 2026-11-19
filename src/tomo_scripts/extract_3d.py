@@ -17,10 +17,16 @@ def create_parser() -> argparse.ArgumentParser:
     """Creates parser"""
     parser = argparse.ArgumentParser(description="Extract 3D subvolumes from STAR coordinates.")
     parser.add_argument("--star", type=Path, required=True,
-                        help="STAR file containing tomogram names and XYZ coordinates in tomogram pixels")
+                        help="STAR file containing tomogram names and XYZ pixel coordinates")
     parser.add_argument("--vol_dir", type=Path, required=True, help="Directory containing tomograms")
+    parser.add_argument("--tomo_column", "--tomo-column", default=TOMO_COLUMN,
+                        help="STAR column containing tomogram names (default: %(default)s)")
     parser.add_argument("--out", type=Path, required=True, help="Output directory")
     parser.add_argument("--boxsize", type=int, required=True, help="Boxsize in px")
+    parser.add_argument("--coords_scale", type=float,
+                        help="Input coordinate pixel size in angstroms; converts coordinates to tomogram pixels (default: coordinates already use tomogram pixels)")
+    parser.add_argument("--voxel_spacing", type=float,
+                        help="Tomogram voxel size in angstroms (default: MRC header); also used for extracted MRC and STAR pixel sizes")
     parser.add_argument("--apix", type=float, help="Tilt-series pixel size in angstroms for STAR output (defaults to the MRC voxel size)")
     parser.add_argument("--voltage", type=float, default=300.0, help="Microscope voltage in kV")
     parser.add_argument("--cs", type=float, default=2.5, help="Spherical aberration in mm")
@@ -46,10 +52,10 @@ def extract_and_write(coords: Iterable[Tuple], volume: np.ndarray, output_dir: P
     return written_files
 
 
-def read_star_particles(path: Path) -> pd.DataFrame:
+def read_star_particles(path: Path, tomo_column: str = TOMO_COLUMN) -> pd.DataFrame:
     """Read coordinate rows from a particles block or a single coordinate loop."""
-    blocks = starfile.read(path, always_dict=True, parse_as_string=[TOMO_COLUMN])
-    required = {TOMO_COLUMN, *COORD_COLUMNS}
+    blocks = starfile.read(path, always_dict=True, parse_as_string=[tomo_column])
+    required = {tomo_column, *COORD_COLUMNS}
     if "particles" in blocks:
         candidates = [blocks["particles"]]
     else:
@@ -57,10 +63,10 @@ def read_star_particles(path: Path) -> pd.DataFrame:
     tables = [table for table in candidates if isinstance(table, pd.DataFrame)
               and required.issubset(table.columns)]
     if len(tables) != 1:
-        raise ValueError(f"{path} must contain one particle table with {', '.join([TOMO_COLUMN, *COORD_COLUMNS])}")
+        raise ValueError(f"{path} must contain one particle table with {', '.join([tomo_column, *COORD_COLUMNS])}")
     particles = tables[0].copy()
-    if particles[TOMO_COLUMN].isna().any() or particles[TOMO_COLUMN].str.strip().isin(["", ".", "?"]).any():
-        raise ValueError(f"{path} contains a missing {TOMO_COLUMN}")
+    if particles[tomo_column].isna().any() or particles[tomo_column].str.strip().isin(["", ".", "?"]).any():
+        raise ValueError(f"{path} contains a missing {tomo_column}")
     particles[COORD_COLUMNS] = particles[COORD_COLUMNS].apply(pd.to_numeric, errors="coerce")
     if not np.isfinite(particles[COORD_COLUMNS].to_numpy(dtype=float)).all():
         raise ValueError(f"{path} contains non-numeric or non-finite particle coordinates")
@@ -68,17 +74,15 @@ def read_star_particles(path: Path) -> pd.DataFrame:
 
 
 def find_tomogram(vol_dir: Path, name: str) -> Path:
-    path = vol_dir / name
-    stem = path.stem if path.suffix.lower() == ".mrc" else path.name
-    for candidate in (path, path.with_name(f"{stem}.mrc"), path.with_name(f"rec_{stem}.mrc")):
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError(f"No tomogram found for {name!r} in {vol_dir}")
+    path = vol_dir / f"{name}.mrc"
+    if path.is_file():
+        return path
+    raise FileNotFoundError(f"No tomogram found at {path}")
 
 
 def run(args: argparse.Namespace) -> None:
-    particles = read_star_particles(args.star)
-    groups = particles.groupby(TOMO_COLUMN, sort=False)
+    particles = read_star_particles(args.star, args.tomo_column)
+    groups = particles.groupby(args.tomo_column, sort=False)
     tomograms = {}
     prefixes = set()
     for name in groups.groups:
@@ -102,9 +106,16 @@ def run(args: argparse.Namespace) -> None:
         with mrcfile.mmap(path) as mrc:
             if mrc.data.ndim != 3:
                 raise ValueError(f"{path} must contain a 3D tomogram")
-            apix = float(mrc.voxel_size.x)
-            coords = rows[COORD_COLUMNS].itertuples(index=False, name=None)
-            written = extract_and_write(coords, mrc.data, particle_dir, apix=mrc.voxel_size,
+            spacing = np.array([float(mrc.voxel_size[axis]) for axis in ("x", "y", "z")])
+            if args.voxel_spacing is not None:
+                spacing[:] = args.voxel_spacing
+            if not np.isfinite(spacing).all() or (spacing <= 0).any():
+                raise ValueError(f"{path} has invalid voxel sizes; provide --voxel_spacing")
+            apix = float(spacing[0])
+            coords = rows[COORD_COLUMNS].to_numpy(dtype=float)
+            if args.coords_scale is not None:
+                coords = coords * args.coords_scale / spacing
+            written = extract_and_write(coords, mrc.data, particle_dir, apix=tuple(spacing),
                                         tomoname=prefix, box_size=args.boxsize)
         skipped += len(rows) - len(written)
         if written:
@@ -138,6 +149,10 @@ def _main_() -> None:
         parser.error("--boxsize must be positive")
     if args.apix is not None and (not np.isfinite(args.apix) or args.apix <= 0):
         parser.error("--apix must be a positive pixel size")
+    for option in ("coords_scale", "voxel_spacing"):
+        value = getattr(args, option)
+        if value is not None and (not np.isfinite(value) or value <= 0):
+            parser.error(f"--{option} must be positive and finite")
     run(args)
 
 
