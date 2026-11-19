@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Project particles from tomograms into a stack."""
+"""Project particles from tomograms into a stack for CryoSPARC."""
 
-from argparse import ArgumentParser
+from argparse import ArgumentParser, SUPPRESS
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -109,7 +109,6 @@ def extract_and_project(args, shape_xyz):
 
     num_angles = len(args.angles)
     num_images = len(picks) * num_angles
-    contrast = -1 if args.invert_contrast else 1
     stack_name = "particles.mrcs"
     star_name = "particles_stack.star"
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -131,7 +130,7 @@ def extract_and_project(args, shape_xyz):
                         crop = crop_volume(tomo.data, centers_zyx[pick_index], crop_shape_zyx)
                         first_image = tomogram_offset + pick_index * num_angles
                         for image_index, angle in enumerate(args.angles, start=first_image):
-                            stack.data[image_index] = contrast * project(crop, angle, box_size)
+                            stack.data[image_index] = -project(crop, angle, box_size)
                 tomogram_offset += len(rows) * num_angles
 
         write_stack_star(staging / star_name, stack_name, num_images, box_size, args.voxel_spacing)
@@ -152,9 +151,7 @@ def main():
     parser.add_argument("--coords_scale", type=float, default=1,
                         help="Multiply input coordinates by this factor to convert to angstroms")
     parser.add_argument("--col_name", default="rlnTomoName", help="STAR column containing tomogram names")
-    parser.add_argument("--angles", type=float, nargs="+", default=[0.0],
-                        help="Projection angles about Y in degrees (default: 0)")
-    parser.add_argument("--invert_contrast", action="store_true", help="Invert the projected particle contrast")
+    parser.add_argument("--angles", type=float, nargs="+", default=[0.0], help=SUPPRESS)
     args = parser.parse_args()
 
     if not np.isfinite(args.voxel_spacing) or args.voxel_spacing <= 0:
