@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Project particles from tomograms into a stack for CryoSPARC."""
+"""Project particles into a CryoSPARC stack, loading one tomogram into RAM at a time."""
 
 from argparse import ArgumentParser, SUPPRESS
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import perf_counter
 
 import mrcfile
 import numpy as np
@@ -107,31 +108,34 @@ def extract_and_project(args, shape_xyz):
         # Match the existing tilt projections by extending the crop along X.
         crop_shape_zyx[2] = (box_size * 3 // 2) // 2 * 2
 
-    num_angles = len(args.angles)
-    num_images = len(picks) * num_angles
+    num_images = len(picks) * len(args.angles)
     stack_name = "particles.mrcs"
     star_name = "particles_stack.star"
     args.out_dir.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=args.out_dir) as tmp:
         staging = Path(tmp)
-        # Mode 2 stores float32. Write projections directly to their stack indices.
+        # Mode 2 stores float32. Write projections directly to disk in stack order.
         with mrcfile.new_mmap(staging / stack_name, (num_images, box_size, box_size),
                               mrc_mode=2) as stack:
             stack.set_image_stack()
             stack.voxel_size = args.voxel_spacing
-            tomogram_offset = 0
+            image_index = 0
             for name, rows in tqdm(groups, desc="Projecting tomograms"):
-                with mrcfile.mmap(tomograms[name], permissive=True) as tomo:
+                started = perf_counter()
+                with mrcfile.open(tomograms[name], permissive=True) as tomo:
+                    opened = perf_counter()
                     if tomo.data is None or tomo.data.ndim != 3:
                         raise ValueError(f"{tomograms[name]} must contain a 3D tomogram")
                     centers_zyx = rows[COORD_COLUMNS[::-1]].to_numpy().astype(int)
-                    # Visit nearby Z slices together while preserving the original stack order.
-                    for pick_index in np.argsort(centers_zyx[:, 0], kind="stable"):
-                        crop = crop_volume(tomo.data, centers_zyx[pick_index], crop_shape_zyx)
-                        first_image = tomogram_offset + pick_index * num_angles
-                        for image_index, angle in enumerate(args.angles, start=first_image):
+                    for center in centers_zyx:
+                        crop = crop_volume(tomo.data, center, crop_shape_zyx)
+                        for angle in args.angles:
                             stack.data[image_index] = -project(crop, angle, box_size)
-                tomogram_offset += len(rows) * num_angles
+                            image_index += 1
+                        # A crop can hold a view of the tomogram's entire backing buffer.
+                        del crop
+                tqdm.write(f"{name}: {len(rows)} picks, {opened - started:.1f} s to open, "
+                           f"{perf_counter() - opened:.1f} s to project and write")
 
         write_stack_star(staging / star_name, stack_name, num_images, box_size, args.voxel_spacing)
         for name in (stack_name, star_name):
