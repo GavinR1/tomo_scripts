@@ -36,9 +36,13 @@ ENV/
 Thumbs.db
 
 # Jupyter Notebook
+*.ipynb
 .ipynb_checkpoints
 
 # Output files
 *.log
 output/
 results/
+
+# Data folder
+data/
